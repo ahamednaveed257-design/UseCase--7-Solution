@@ -1,0 +1,34 @@
+# Knowledge Curator
+
+An approval-gated Knowledge Curator API for article review and ticket-theme gap analysis.
+
+## Run
+
+```powershell
+python -m pip install -r requirements.txt
+python -m uvicorn Main:app --reload
+```
+
+Open the interactive API documentation at `http://127.0.0.1:8000/docs`.
+
+To run the Streamlit shell:
+
+```powershell
+python -m streamlit run streamlit_app.py
+```
+
+## API
+
+- `GET /health`
+- `POST /v1/articles/review`
+- `POST /v1/gaps/analyze`
+- `POST /v1/architecture/design`
+- `POST /v1/approval/handoff`
+
+All generated findings and drafts have `approvalStatus = "PENDING_HUMAN_APPROVAL"`.
+There is no publishing endpoint or automatic approval behavior.
+
+## Audit
+
+Local development audit events are stored in `knowledge_curator.db`. The payload and
+evidence count are recorded only after an operation is executed.
