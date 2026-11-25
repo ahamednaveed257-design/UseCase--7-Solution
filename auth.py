@@ -1,18 +1,9 @@
 import os
-from functools import lru_cache
-
 import httpx
 import jwt
 from fastapi import HTTPException
 
 VALID_ROLES = {"Reader", "Knowledge Analyst", "Knowledge Manager", "Admin"}
-
-
-@lru_cache(maxsize=4)
-def get_jwks(jwks_url: str) -> dict:
-    response = httpx.get(jwks_url, timeout=10)
-    response.raise_for_status()
-    return response.json()
 
 
 def resolve_identity(authorization: str | None) -> tuple[str, set[str]]:
@@ -35,7 +26,7 @@ def resolve_identity(authorization: str | None) -> tuple[str, set[str]]:
             audience=audience,
             issuer=issuer,
         )
-    except Exception as exc:
+    except (httpx.HTTPError, jwt.PyJWTError, ValueError) as exc:
         raise HTTPException(status_code=401, detail="Bearer token is invalid.") from exc
 
     subject = claims.get("sub")
@@ -48,7 +39,7 @@ def resolve_identity(authorization: str | None) -> tuple[str, set[str]]:
         if isinstance(value, str):
             value = [value]
         if isinstance(value, list):
-            roles.update(role for role in value if role in VALID_ROLES)
+            roles.update(role for role in value if isinstance(role, str) and role in VALID_ROLES)
 
     if not roles:
         raise HTTPException(status_code=403, detail="No approved Knowledge Curator role is present.")

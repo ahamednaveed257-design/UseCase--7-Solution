@@ -6,6 +6,7 @@ import threading
 import uuid
 import os
 import io
+import json
 from pathlib import Path
 from typing import Literal
 
@@ -323,8 +324,11 @@ def integrations_status() -> dict[str, str]:
     repository_url = os.getenv("KC_ARTICLE_REPOSITORY_URL")
     status["articleRepository"] = "configured" if repository_url else "not_configured"
     status["approvedSearch"] = "configured" if os.getenv("KC_APPROVED_SEARCH_URL") else "not_configured"
-    status["redis"] = "configured" if os.getenv("REDIS_URL") else "not_configured"
-    status["qdrant"] = "configured" if os.getenv("QDRANT_URL") else "not_configured"
+    status["approvalHandoff"] = "configured" if os.getenv("KC_APPROVAL_HANDOFF_URL") else "not_configured"
+    status["redis"] = "endpoint_set_not_integrated" if os.getenv("REDIS_URL") else "not_configured"
+    status["qdrant"] = "endpoint_set_not_integrated" if os.getenv("QDRANT_URL") else "not_configured"
+    status["foundry"] = "configured" if os.getenv("AZURE_AI_PROJECT_ENDPOINT") else "not_configured"
+    status["telemetryExporter"] = "configured" if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") else "not_configured"
     status["postgresAudit"] = "configured" if os.getenv("DATABASE_URL", "").startswith("postgresql") else "local_sqlite"
     status["oidc"] = "configured" if os.getenv("KC_OIDC_ISSUER") and os.getenv("KC_OIDC_JWKS_URL") else "not_configured"
     status["automaticPublishing"] = "disabled"
@@ -531,10 +535,8 @@ def review_article(
                 },
             )
         content = source["content"]
-        title = source["title"]
     else:
         content = payload.articleContent or ""
-        title = "Ad-hoc knowledge article"
 
     findings: list[Finding] = []
     evidence: list[Evidence] = []
@@ -696,8 +698,6 @@ def find_gaps(
         priority = "MEDIUM"
     elif payload.significantImpact is True:
         priority = "HIGH"
-    elif payload.significantImpact is False:
-        priority = "LOW"
     else:
         priority = "MEDIUM"
     unresolved = []
@@ -707,8 +707,8 @@ def find_gaps(
         unresolved.append("The approved search returned no article matches; confirm the index is complete before concluding coverage is NONE.")
     else:
         unresolved.append("Matching articles were found, but coverage adequacy was not evaluated; human review is needed before assigning FULL.")
-    if coverage == "NONE" and payload.significantImpact is None:
-        unresolved.append("Impact significance was not provided; HIGH priority cannot be verified.")
+    if coverage == "NONE" and payload.significantImpact is not True:
+        unresolved.append("HIGH priority requires verified significant impact; priority remains provisional for human review.")
 
     evidence.extend(
         Evidence(
@@ -767,19 +767,57 @@ def approval_handoff(
     x_user_role: str = Header(default="Knowledge Manager"),
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
-    authorize(x_user_role, "approval_handoff", authorization)
-    request_id = str(uuid.uuid4())
+    actor_id = authorize(
+        x_user_role,
+        "approval_handoff",
+        authorization,
+        development_user_id=x_user_id,
+    )
+    handoff_url = os.getenv("KC_APPROVAL_HANDOFF_URL")
+    if not handoff_url:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "INPUT_REQUIRED",
+                "message": "External human approval workflow is not configured; no handoff was made.",
+                "requiredInputs": ["KC_APPROVAL_HANDOFF_URL"],
+            },
+        )
+    if payload.get("approvalStatus") != APPROVAL_STATUS:
+        raise HTTPException(status_code=422, detail="Only approval-pending content may be handed off.")
+    if payload.get("mode") not in {"review_article", "find_gaps", "design_foundry_architecture"}:
+        raise HTTPException(status_code=422, detail="A supported result mode is required.")
+
+    headers = {"Content-Type": "application/json"}
+    handoff_token = os.getenv("KC_APPROVAL_HANDOFF_TOKEN")
+    if handoff_token:
+        headers["Authorization"] = f"Bearer {handoff_token}"
+    try:
+        response = httpx.post(
+            handoff_url,
+            json=payload,
+            headers=headers,
+            timeout=10,
+        )
+        response.raise_for_status()
+        remote_result = response.json() if response.content else {}
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="External approval handoff failed.") from exc
+    if not isinstance(remote_result, dict):
+        raise HTTPException(status_code=502, detail="External approval workflow returned an invalid response.")
+
+    request_id = str(remote_result.get("handoffId") or uuid.uuid4())
     audit.append(
-        x_user_id,
+        actor_id,
         "approval_handoff",
         APPROVAL_STATUS,
         int(payload.get("evidenceCount", 0)) if isinstance(payload.get("evidenceCount"), int) else 0,
-        mask_sensitive(str(payload)),
+        mask_sensitive(json.dumps(payload)),
     )
     return {
         "handoffId": request_id,
         "approvalStatus": APPROVAL_STATUS,
         "automaticPublishing": "disabled",
-        "message": "Handoff recorded for external human review only.",
+        "message": "Submitted to the configured external human approval workflow.",
     }
 """  """

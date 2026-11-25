@@ -44,6 +44,13 @@ The compose stack starts PostgreSQL, Redis, Qdrant, the API, and Streamlit. Set
 `POSTGRES_PASSWORD` and external integration variables before a shared or production
 deployment. `.env.example` lists approved integration settings.
 
+For local Docker use, copy `.env.example` to `.env` and set a unique `POSTGRES_PASSWORD`.
+Gap analysis returns `INPUT_REQUIRED` until `KC_APPROVED_SEARCH_URL` is configured;
+approval handoff returns `INPUT_REQUIRED` until `KC_APPROVAL_HANDOFF_URL` is configured.
+Matching search results are conservatively classified as `PARTIAL`; a human must verify
+adequacy before coverage can be called `FULL`. Review staleness and ambiguity scores are
+`null` until the required authoritative metadata and standards are available.
+
 ## Identity
 
 Development may use `x-user-role` only when `KC_ALLOW_HEADER_AUTH=true`. Production,

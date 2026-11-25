@@ -105,6 +105,11 @@ with tab_gap:
     theme = st.text_input("Ticket theme")
     themes = st.text_area("Additional pre-clustered themes (one per line)")
     resolution_notes = st.text_area("Resolution notes", height=220)
+    impact_option = st.selectbox(
+        "Significant impact",
+        ["Unknown", "Yes", "No"],
+        help="HIGH priority for NONE coverage requires evidence of significant impact.",
+    )
     if st.button("Analyze gaps"):
         if not theme:
             st.error("Ticket theme is required.")
@@ -114,6 +119,8 @@ with tab_gap:
                 "ticketThemes": [line.strip() for line in themes.splitlines() if line.strip()],
                 "resolutionNotes": resolution_notes or None,
             }
+            if impact_option != "Unknown":
+                payload["significantImpact"] = impact_option == "Yes"
             try:
                 response = httpx.post(
                     f"{api_url}/v1/gaps/analyze",

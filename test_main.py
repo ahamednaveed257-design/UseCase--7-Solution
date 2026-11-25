@@ -1,3 +1,6 @@
+import sqlite3
+
+import Main
 from fastapi.testclient import TestClient
 
 from Main import app
@@ -11,8 +14,8 @@ def test_review_article_has_pending_approval_and_scores():
         "/v1/articles/review",
         json={
             "articleContent": (
-                "Prerequisite: Confirm network access. "
-                "Validate: Confirm the test page opens. "
+                "Prerequisites: Confirm network access.\n"
+                "Validation: Confirm the test page opens.\n"
                 "Rollback: Disconnect and restore the previous network."
             )
         },
@@ -27,7 +30,12 @@ def test_review_article_has_pending_approval_and_scores():
         "ambiguityScore",
         "structureScore",
     }
-    assert all(0 <= score <= 100 for score in body["scores"].values())
+    assert body["scores"]["stalenessScore"] is None
+    assert body["scores"]["ambiguityScore"] is None
+    assert all(
+        score is None or 0 <= score <= 100
+        for score in body["scores"].values()
+    )
 
 
 def test_missing_article_input_is_rejected():
@@ -49,12 +57,8 @@ def test_gap_analysis_has_no_meaningful_draft_without_resolution_evidence():
         json={"theme": "Printer not responding"},
     )
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["coverage"] == "NONE"
-    assert body["priority"] == "HIGH"
-    assert body["approvalStatus"] == "PENDING_HUMAN_APPROVAL"
-    assert "[TO REVIEW]" in body["draftArticle"]["steps"][0]
+    assert response.status_code == 503
+    assert response.json()["detail"]["status"] == "INPUT_REQUIRED"
 
 
 def test_health_reports_publication_disabled():
@@ -99,3 +103,108 @@ def test_plain_text_upload_review_is_pending():
     )
     assert response.status_code == 200
     assert response.json()["approvalStatus"] == "PENDING_HUMAN_APPROVAL"
+
+
+def test_upload_size_limit_is_enforced(monkeypatch):
+    monkeypatch.setenv("KC_MAX_UPLOAD_BYTES", "10")
+    response = client.post(
+        "/v1/articles/upload",
+        files={"file": ("article.md", b"x" * 11, "text/markdown")},
+    )
+    assert response.status_code == 413
+
+
+def test_gap_analysis_never_calls_matches_full(monkeypatch):
+    class SearchResponse:
+        content = b"{}"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"results": [{"id": "KB-ABC", "content": "Relevant article excerpt."}]}
+
+    monkeypatch.setenv("KC_APPROVED_SEARCH_URL", "https://approved-search.example/query")
+    monkeypatch.setattr(Main.httpx, "post", lambda *args, **kwargs: SearchResponse())
+    response = client.post(
+        "/v1/gaps/analyze",
+        json={
+            "theme": "VPN connection failure",
+            "resolutionNotes": "Apply the approved network profile and retest connectivity.",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["coverage"] == "PARTIAL"
+    assert body["priority"] == "MEDIUM"
+    assert {item["sourceType"] for item in body["verifiedEvidence"]} == {
+        "knowledge_article",
+        "ticket_theme",
+        "resolution_note",
+    }
+
+
+def test_production_audit_identity_comes_from_validated_token(monkeypatch):
+    monkeypatch.setenv("KC_ENVIRONMENT", "production")
+    monkeypatch.setenv("KC_ALLOW_HEADER_AUTH", "false")
+    monkeypatch.setattr(
+        Main,
+        "resolve_identity",
+        lambda token: ("verified-subject-123", {"Knowledge Analyst"}),
+    )
+    response = client.post(
+        "/v1/articles/review",
+        json={"articleContent": "Validation: Confirm the service responds."},
+        headers={
+            "authorization": "Bearer test-token",
+            "x-user-id": "spoofed-user",
+            "x-user-role": "Reader",
+        },
+    )
+
+    assert response.status_code == 200
+    with sqlite3.connect(Main.DB_PATH) as connection:
+        row = connection.execute(
+            "SELECT user_id FROM audit_events WHERE operation = ? AND user_id = ? LIMIT 1",
+            ("review_article", "verified-subject-123"),
+        ).fetchone()
+    assert row[0] == "verified-subject-123"
+
+
+def test_approval_handoff_is_not_reported_successful_when_unconfigured(monkeypatch):
+    monkeypatch.delenv("KC_APPROVAL_HANDOFF_URL", raising=False)
+    response = client.post(
+        "/v1/approval/handoff",
+        json={"mode": "find_gaps", "approvalStatus": "PENDING_HUMAN_APPROVAL"},
+    )
+    assert response.status_code == 503
+    assert "no handoff was made" in response.json()["detail"]["message"]
+
+
+def test_approval_handoff_posts_only_pending_work(monkeypatch):
+    class HandoffResponse:
+        content = b'{"handoffId":"review-123"}'
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"handoffId": "review-123"}
+
+    monkeypatch.setenv("KC_APPROVAL_HANDOFF_URL", "https://approval.example/submit")
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        return HandoffResponse()
+
+    monkeypatch.setattr(Main.httpx, "post", fake_post)
+    response = client.post(
+        "/v1/approval/handoff",
+        json={"mode": "find_gaps", "approvalStatus": "PENDING_HUMAN_APPROVAL"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["handoffId"] == "review-123"
+    assert calls[0][1]["json"]["approvalStatus"] == "PENDING_HUMAN_APPROVAL"
