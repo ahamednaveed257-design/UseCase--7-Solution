@@ -6,7 +6,6 @@ import threading
 import uuid
 import os
 import io
-import json
 from pathlib import Path
 from typing import Literal
 
@@ -57,15 +56,24 @@ def contains_sensitive(text: str) -> bool:
     return any(pattern.search(text) for pattern in SENSITIVE_PATTERNS)
 
 
-def authorize(role: str, operation: str, authorization: str | None = None) -> None:
+def authorize(
+    role: str,
+    operation: str,
+    authorization: str | None = None,
+    development_user_id: str = "anonymous",
+) -> str:
     allow_header_auth = os.getenv("KC_ALLOW_HEADER_AUTH", "true").lower() == "true"
     environment = os.getenv("KC_ENVIRONMENT", "development").lower()
     if not allow_header_auth or environment in {"production", "uat", "test"}:
-        role = resolve_identity(authorization)
+        user_id, roles = resolve_identity(authorization)
+        if not roles.intersection(OPERATION_ROLES[operation]):
+            raise HTTPException(status_code=403, detail=f"Role is not authorized to {operation}.")
+        return user_id
     if role not in VALID_ROLES:
         raise HTTPException(status_code=403, detail="Role is not authorized.")
     if role not in OPERATION_ROLES[operation]:
         raise HTTPException(status_code=403, detail=f"Role is not authorized to {operation}.")
+    return development_user_id
 
 
 class Evidence(BaseModel):
@@ -95,6 +103,7 @@ class GapInput(BaseModel):
     theme: str = Field(min_length=1)
     ticketThemes: list[str] = Field(default_factory=list)
     resolutionNotes: str | None = None
+    significantImpact: bool | None = None
 
     @model_validator(mode="after")
     def validate_sensitive_data(self) -> "GapInput":
@@ -115,7 +124,7 @@ class Finding(BaseModel):
 class ArticleReviewOutput(BaseModel):
     mode: Literal["review_article"] = "review_article"
     articleId: str
-    scores: dict[str, int]
+    scores: dict[str, int | None]
     issues: list[Finding]
     verifiedEvidence: list[Evidence]
     inferredConcerns: list[str]
@@ -241,12 +250,9 @@ APPROVED_REFERENCES = {
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
-try:
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
-    FastAPIInstrumentor.instrument_app(app)
-except Exception:
-    pass
+FastAPIInstrumentor.instrument_app(app)
 
 
 @app.get("/health")
@@ -288,15 +294,24 @@ async def upload_article(
     x_user_role: str = Header(default="Knowledge Analyst"),
     authorization: str | None = Header(default=None),
 ) -> ArticleReviewOutput:
-    authorize(x_user_role, "review_article", authorization)
-    content = extract_uploaded_text(file.filename or "article.txt", await file.read())
+    actor_id = authorize(
+        x_user_role,
+        "review_article",
+        authorization,
+        development_user_id=x_user_id,
+    )
+    max_upload_bytes = int(os.getenv("KC_MAX_UPLOAD_BYTES", str(5 * 1024 * 1024)))
+    content_bytes = await file.read(max_upload_bytes + 1)
+    if len(content_bytes) > max_upload_bytes:
+        raise HTTPException(status_code=413, detail="Uploaded file exceeds the configured size limit.")
+    content = extract_uploaded_text(file.filename or "article.txt", content_bytes)
     if not content.strip():
         raise HTTPException(status_code=422, detail="The uploaded article has no readable text.")
     if contains_sensitive(content):
         raise HTTPException(status_code=422, detail="Sensitive values are not permitted in article content.")
     return review_article(
         ArticleReviewInput(articleContent=content),
-        x_user_id=x_user_id,
+        x_user_id=actor_id,
         x_user_role=x_user_role,
         authorization=authorization,
     )
@@ -323,7 +338,12 @@ def design_architecture(
     x_user_role: str = Header(default="Knowledge Analyst"),
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
-    authorize(x_user_role, "design_architecture", authorization)
+    actor_id = authorize(
+        x_user_role,
+        "design_architecture",
+        authorization,
+        development_user_id=x_user_id,
+    )
 
     unresolved = []
     if not payload.sources:
@@ -457,7 +477,7 @@ flowchart LR
 """
 
     audit.append(
-        x_user_id,
+        actor_id,
         "design_architecture",
         APPROVAL_STATUS,
         len(payload.sources) + len(payload.approvedReferences),
@@ -478,7 +498,12 @@ def review_article(
     x_user_role: str = Header(default="Knowledge Analyst"),
     authorization: str | None = Header(default=None),
 ) -> ArticleReviewOutput:
-    authorize(x_user_role, "review_article", authorization)
+    actor_id = authorize(
+        x_user_role,
+        "review_article",
+        authorization,
+        development_user_id=x_user_id,
+    )
     article_id = payload.articleId or f"AD-HOC-{uuid.uuid4().hex[:8]}"
     if payload.articleId:
         repository_url = os.getenv("KC_ARTICLE_REPOSITORY_URL")
@@ -522,7 +547,10 @@ def review_article(
     evidence.append(article_evidence)
 
     lower = content.lower()
-    if "prerequisite" not in lower:
+    has_prerequisites = re.search(r"(?im)^\s*(?:#{1,6}\s*)?prerequisites?\s*:", content) is not None
+    has_validation = re.search(r"(?im)^\s*(?:#{1,6}\s*)?(?:validation|verification)\s*:", content) is not None
+    has_rollback = re.search(r"(?im)^\s*(?:#{1,6}\s*)?(?:rollback|recovery)\s*:", content) is not None
+    if not has_prerequisites:
         findings.append(
             Finding(
                 severity="HIGH",
@@ -532,7 +560,7 @@ def review_article(
                 recommendation="Add a prerequisites section with identity, access, and environment requirements.",
             )
         )
-    if not re.search(r"(?i)\b(validate|verification|confirm|test)\b", content):
+    if not has_validation:
         findings.append(
             Finding(
                 severity="HIGH",
@@ -542,7 +570,7 @@ def review_article(
                 recommendation="Add an observable validation result after each major procedure step.",
             )
         )
-    if "rollback" not in lower:
+    if not has_rollback:
         findings.append(
             Finding(
                 severity="HIGH",
@@ -570,23 +598,20 @@ def review_article(
     )
     evidence.append(template_evidence)
 
-    unresolved: list[str] = []
-    if len(content.split()) < 10:
-        unresolved.append("Insufficient article content to assess staleness and duplicate coverage.")
-
-    staleness_score = 100 if re.search(r"\b20(2[4-9]|3[0-9])\b", content) or "microsoft entra" in lower else 70
-    ambiguity_score = 90 if re.search(r"\b(prerequisite|validate|confirmation|test)\b", lower) else 55
-    structure_score = 90 if all(token in lower for token in ("prerequisite", "validate", "rollback")) else 60
-    if "ad-hoc" in title.lower():
-        staleness_score = 70
+    structure_score = round(100 * sum((has_prerequisites, has_validation, has_rollback)) / 3)
+    unresolved: list[str] = [
+        "Staleness cannot be scored without an authoritative review date and freshness policy.",
+        "Ambiguity cannot be scored without an approved writing standard or review method.",
+        "Duplicate, contradiction, and retired-product checks require related-article and retired-product evidence.",
+    ]
 
     findings.sort(key=lambda item: SEVERITY_ORDER[item.severity])
     recommendations = [finding.recommendation for finding in findings]
     output = ArticleReviewOutput(
         articleId=article_id,
         scores={
-            "stalenessScore": staleness_score,
-            "ambiguityScore": ambiguity_score,
+            "stalenessScore": None,
+            "ambiguityScore": None,
             "structureScore": structure_score,
         },
         issues=findings,
@@ -597,7 +622,7 @@ def review_article(
     )
 
     audit.append(
-        x_user_id,
+        actor_id,
         "review_article",
         APPROVAL_STATUS,
         len(evidence),
@@ -613,52 +638,94 @@ def find_gaps(
     x_user_role: str = Header(default="Knowledge Analyst"),
     authorization: str | None = Header(default=None),
 ) -> GapOutput:
-    authorize(x_user_role, "find_gaps", authorization)
+    actor_id = authorize(
+        x_user_role,
+        "find_gaps",
+        authorization,
+        development_user_id=x_user_id,
+    )
     themes = [payload.theme, *payload.ticketThemes]
     matched = []
     evidence = []
-    environment = os.getenv("KC_ENVIRONMENT", "development").lower()
     search_url = os.getenv("KC_APPROVED_SEARCH_URL")
 
     if not search_url:
-        matched = []
-        evidence = []
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "INPUT_REQUIRED",
+                "message": "Gap coverage cannot be assessed without the approved knowledge search service.",
+                "requiredInputs": ["KC_APPROVED_SEARCH_URL"],
+            },
+        )
 
-    if search_url:
-        try:
-            search_response = httpx.post(
-                search_url,
-                json={"themes": themes, "indexes": ["Knowledge Articles", "Resolution Notes"]},
-                headers={"api-key": os.getenv("KC_APPROVED_SEARCH_KEY", "")},
-                timeout=10,
-            )
-            search_response.raise_for_status()
-            for item in search_response.json().get("results", []):
-                article_id = str(item.get("id", "UNKNOWN"))
-                matched.append(article_id)
-                evidence.append(
-                    Evidence(
-                        sourceType="knowledge_article",
-                        sourceId=article_id,
-                        excerpt=mask_sensitive(str(item.get("content", item.get("text", "")))[:500]),
-                    )
+    try:
+        search_response = httpx.post(
+            search_url,
+            json={"themes": themes, "indexes": ["Knowledge Articles", "Resolution Notes"]},
+            headers={"api-key": os.getenv("KC_APPROVED_SEARCH_KEY", "")},
+            timeout=10,
+        )
+        search_response.raise_for_status()
+        search_results = search_response.json().get("results", [])
+        if not isinstance(search_results, list):
+            raise ValueError("Search results must be a list.")
+        for item in search_results:
+            if not isinstance(item, dict):
+                continue
+            article_id = item.get("id")
+            excerpt = item.get("content", item.get("text"))
+            if not isinstance(article_id, str) or not article_id.strip():
+                continue
+            if not isinstance(excerpt, str) or not excerpt.strip():
+                continue
+            matched.append(article_id)
+            evidence.append(
+                Evidence(
+                    sourceType="knowledge_article",
+                    sourceId=article_id,
+                    excerpt=mask_sensitive(excerpt[:500]),
                 )
-        except (httpx.HTTPError, ValueError) as exc:
-            raise HTTPException(status_code=502, detail="Approved knowledge search failed.") from exc
+            )
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Approved knowledge search failed or returned invalid results.") from exc
 
     matched = sorted(set(matched))
-    if matched:
-        coverage = "FULL" if payload.resolutionNotes and len(payload.resolutionNotes.strip()) > 40 else "PARTIAL"
+    coverage = "PARTIAL" if matched else "NONE"
+    if coverage == "PARTIAL":
+        priority = "MEDIUM"
+    elif payload.significantImpact is True:
+        priority = "HIGH"
+    elif payload.significantImpact is False:
+        priority = "LOW"
     else:
-        coverage = "NONE"
-
-    priority = "HIGH" if coverage == "NONE" else "MEDIUM" if coverage == "PARTIAL" else "LOW"
+        priority = "MEDIUM"
     unresolved = []
     if not payload.resolutionNotes:
         unresolved.append("Resolution notes were not provided; the draft cannot be based on a complete remediation record.")
     if not matched:
-        unresolved.append("No meaningful existing article match was verified for this theme.")
+        unresolved.append("The approved search returned no article matches; confirm the index is complete before concluding coverage is NONE.")
+    else:
+        unresolved.append("Matching articles were found, but coverage adequacy was not evaluated; human review is needed before assigning FULL.")
+    if coverage == "NONE" and payload.significantImpact is None:
+        unresolved.append("Impact significance was not provided; HIGH priority cannot be verified.")
 
+    evidence.extend(
+        Evidence(
+            sourceType="ticket_theme",
+            sourceId=f"submitted-theme-{index + 1}",
+            excerpt=mask_sensitive(theme[:500]),
+        )
+        for index, theme in enumerate(themes)
+    )
+    if payload.resolutionNotes:
+        evidence.append(
+            Evidence(
+                sourceType="resolution_note",
+                sourceId="submitted-resolution-notes",
+                excerpt=mask_sensitive(payload.resolutionNotes[:500]),
+            )
+        )
     draft_article = {
         "title": f"Troubleshooting: {payload.theme}",
         "prerequisites": "[TO REVIEW] Add identity, access, environment, and device requirements.",
@@ -684,7 +751,7 @@ def find_gaps(
         unresolvedQuestions=unresolved,
     )
     audit.append(
-        x_user_id,
+        actor_id,
         "find_gaps",
         APPROVAL_STATUS,
         len(evidence),

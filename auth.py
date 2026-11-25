@@ -15,7 +15,7 @@ def get_jwks(jwks_url: str) -> dict:
     return response.json()
 
 
-def resolve_identity(authorization: str | None) -> str:
+def resolve_identity(authorization: str | None) -> tuple[str, set[str]]:
     issuer = os.getenv("KC_OIDC_ISSUER")
     audience = os.getenv("KC_OIDC_AUDIENCE")
     jwks_url = os.getenv("KC_OIDC_JWKS_URL")
@@ -38,13 +38,18 @@ def resolve_identity(authorization: str | None) -> str:
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Bearer token is invalid.") from exc
 
+    subject = claims.get("sub")
+    if not isinstance(subject, str) or not subject.strip():
+        raise HTTPException(status_code=401, detail="Bearer token has no subject.")
+
+    roles: set[str] = set()
     for claim_name in ("roles", "role", "groups"):
         value = claims.get(claim_name)
         if isinstance(value, str):
             value = [value]
         if isinstance(value, list):
-            roles = [role for role in value if role in VALID_ROLES]
-            if roles:
-                return roles[0]
+            roles.update(role for role in value if role in VALID_ROLES)
 
-    raise HTTPException(status_code=403, detail="No approved Knowledge Curator role is present.")
+    if not roles:
+        raise HTTPException(status_code=403, detail="No approved Knowledge Curator role is present.")
+    return subject, roles
