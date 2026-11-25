@@ -1,3 +1,5 @@
+import os
+
 import httpx
 import streamlit as st
 
@@ -5,7 +7,15 @@ st.set_page_config(page_title="Knowledge Curator", page_icon="KC", layout="wide"
 st.title("Knowledge Curator")
 st.caption("All findings and drafts require PENDING_HUMAN_APPROVAL. Automatic publishing is disabled.")
 
-api_url = st.sidebar.text_input("API base URL", value="http://127.0.0.1:8000")
+api_url = st.sidebar.text_input("API base URL", value=os.getenv("KC_API_URL", "http://127.0.0.1:8000"))
+role = st.sidebar.selectbox(
+    "Local development role",
+    ["Reader", "Knowledge Analyst", "Knowledge Manager", "Admin"],
+)
+bearer_token = st.sidebar.text_input("Bearer token (non-development)", type="password")
+request_headers = {"x-user-role": role}
+if bearer_token:
+    request_headers["Authorization"] = f"Bearer {bearer_token}"
 
 tab_review, tab_gap, tab_architecture = st.tabs(
     ["Review Article", "Find Gaps", "Architecture Design"]
@@ -14,20 +24,39 @@ tab_review, tab_gap, tab_architecture = st.tabs(
 with tab_review:
     article_id = st.text_input("Article ID", placeholder="KB-001")
     article_content = st.text_area("Article content", height=220)
+    uploaded_article = st.file_uploader(
+        "Or upload article",
+        type=["txt", "md", "docx", "pdf", "json", "csv", "xml", "yaml", "yml", "html"],
+    )
     if st.button("Review article", type="primary"):
-        if not article_id and not article_content:
-            st.error("Provide an Article ID or article content.")
+        if not article_id and not article_content and uploaded_article is None:
+            st.error("Provide an Article ID, article content, or article file.")
         else:
-            payload = {
-                "articleId": article_id or None,
-                "articleContent": article_content or None,
-            }
             try:
-                response = httpx.post(
-                    f"{api_url}/v1/articles/review",
-                    json=payload,
-                    timeout=30,
-                )
+                if uploaded_article is not None:
+                    response = httpx.post(
+                        f"{api_url}/v1/articles/upload",
+                        files={
+                            "file": (
+                                uploaded_article.name,
+                                uploaded_article.getvalue(),
+                                uploaded_article.type,
+                            )
+                        },
+                        headers=request_headers,
+                        timeout=30,
+                    )
+                else:
+                    payload = {
+                        "articleId": article_id or None,
+                        "articleContent": article_content or None,
+                    }
+                    response = httpx.post(
+                        f"{api_url}/v1/articles/review",
+                        json=payload,
+                        headers=request_headers,
+                        timeout=30,
+                    )
                 if response.is_success:
                     st.json(response.json())
                 else:
@@ -61,6 +90,7 @@ with tab_architecture:
                 response = httpx.post(
                     f"{api_url}/v1/architecture/design",
                     json=payload,
+                    headers=request_headers,
                     timeout=30,
                 )
                 if response.is_success:
@@ -88,6 +118,7 @@ with tab_gap:
                 response = httpx.post(
                     f"{api_url}/v1/gaps/analyze",
                     json=payload,
+                    headers=request_headers,
                     timeout=30,
                 )
                 if response.is_success:

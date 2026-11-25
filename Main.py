@@ -4,11 +4,17 @@ import re
 import sqlite3
 import threading
 import uuid
+import os
+import io
+import json
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, Header, HTTPException
+import httpx
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from auth import resolve_identity
 
 
 APP_NAME = "Knowledge Curator"
@@ -51,7 +57,11 @@ def contains_sensitive(text: str) -> bool:
     return any(pattern.search(text) for pattern in SENSITIVE_PATTERNS)
 
 
-def authorize(role: str, operation: str) -> None:
+def authorize(role: str, operation: str, authorization: str | None = None) -> None:
+    allow_header_auth = os.getenv("KC_ALLOW_HEADER_AUTH", "true").lower() == "true"
+    environment = os.getenv("KC_ENVIRONMENT", "development").lower()
+    if not allow_header_auth or environment in {"production", "uat", "test"}:
+        role = resolve_identity(authorization)
     if role not in VALID_ROLES:
         raise HTTPException(status_code=403, detail="Role is not authorized.")
     if role not in OPERATION_ROLES[operation]:
@@ -152,60 +162,76 @@ class ArchitectureInput(BaseModel):
 class AuditRepository:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.database_url = os.getenv("DATABASE_URL", f"sqlite:///{path.as_posix()}")
+        self.is_postgres = self.database_url.startswith("postgresql")
         self.lock = threading.Lock()
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
+        if self.is_postgres:
+            import psycopg
+
+            return psycopg.connect(self.database_url)
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         return connection
 
     def _initialize(self) -> None:
         with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS audit_events (
-                    id TEXT PRIMARY KEY,
-                    timestamp TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    operation TEXT NOT NULL,
-                    result_status TEXT NOT NULL,
-                    evidence_count INTEGER NOT NULL,
-                    payload TEXT NOT NULL
+            if self.is_postgres:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS audit_events (
+                        id TEXT PRIMARY KEY,
+                        timestamp TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        user_id TEXT NOT NULL,
+                        operation TEXT NOT NULL,
+                        result_status TEXT NOT NULL,
+                        evidence_count INTEGER NOT NULL,
+                        payload TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
+            else:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS audit_events (
+                        id TEXT PRIMARY KEY,
+                        timestamp TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        operation TEXT NOT NULL,
+                        result_status TEXT NOT NULL,
+                        evidence_count INTEGER NOT NULL,
+                        payload TEXT NOT NULL
+                    )
+                    """
+                )
 
     def append(self, user_id: str, operation: str, result_status: str, evidence_count: int, payload: str) -> str:
         event_id = str(uuid.uuid4())
         with self.lock, self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO audit_events
-                (id, timestamp, user_id, operation, result_status, evidence_count, payload)
-                VALUES (?, datetime('now'), ?, ?, ?, ?, ?)
-                """,
-                (event_id, user_id, operation, result_status, evidence_count, payload),
-            )
+            if self.is_postgres:
+                connection.execute(
+                    """
+                    INSERT INTO audit_events
+                    (id, user_id, operation, result_status, evidence_count, payload)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (event_id, user_id, operation, result_status, evidence_count, payload),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO audit_events
+                    (id, timestamp, user_id, operation, result_status, evidence_count, payload)
+                    VALUES (?, datetime('now'), ?, ?, ?, ?, ?)
+                    """,
+                    (event_id, user_id, operation, result_status, evidence_count, payload),
+                )
         return event_id
 
 
 audit = AuditRepository(DB_PATH)
-
-SAMPLE_ARTICLES = {
-    "KB-001": {
-        "title": "VPN Connectivity Troubleshooting",
-        "content": "Prerequisite: Confirm network access and connect to VPN. Validate: Open https://companyportal.example and confirm authentication. Rollback: Disconnect VPN and reconnect to the previous network.",
-    },
-    "KB-202": {
-        "title": "Teams Audio Troubleshooting",
-        "content": "Check microphone permissions, select the correct output device, and validate a test call.",
-    },
-    "DWP-101": {
-        "title": "BitLocker Recovery",
-        "content": "Confirm identity in Microsoft Entra ID and retrieve the recovery key through the approved administration workflow.",
-    },
-}
 
 APPROVED_REFERENCES = {
     "template": "Knowledge articles should include prerequisites, validation, rollback, ownership, and review date.",
@@ -215,10 +241,79 @@ APPROVED_REFERENCES = {
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
+try:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+    FastAPIInstrumentor.instrument_app(app)
+except Exception:
+    pass
+
 
 @app.get("/health")
 def health() -> dict[str, object]:
     return {"status": "healthy", "approvalStatus": APPROVAL_STATUS, "automaticPublishing": "disabled"}
+
+
+def extract_uploaded_text(filename: str, content: bytes) -> str:
+    suffix = Path(filename).suffix.lower()
+    if suffix in {".txt", ".md", ".json", ".csv", ".xml", ".yaml", ".yml", ".html"}:
+        return content.decode("utf-8", errors="replace")
+    if suffix == ".docx":
+        try:
+            from docx import Document
+
+            document = Document(io.BytesIO(content))
+            return "\n".join(
+                paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="DOCX file could not be parsed.") from exc
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(content))
+            return "\n".join(
+                (page.extract_text() or "") for page in reader.pages
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="PDF file could not be parsed.") from exc
+    raise HTTPException(status_code=422, detail="Unsupported file format.")
+
+
+@app.post("/v1/articles/upload", response_model=ArticleReviewOutput)
+async def upload_article(
+    file: UploadFile = File(...),
+    x_user_id: str = Header(default="anonymous"),
+    x_user_role: str = Header(default="Knowledge Analyst"),
+    authorization: str | None = Header(default=None),
+) -> ArticleReviewOutput:
+    authorize(x_user_role, "review_article", authorization)
+    content = extract_uploaded_text(file.filename or "article.txt", await file.read())
+    if not content.strip():
+        raise HTTPException(status_code=422, detail="The uploaded article has no readable text.")
+    if contains_sensitive(content):
+        raise HTTPException(status_code=422, detail="Sensitive values are not permitted in article content.")
+    return review_article(
+        ArticleReviewInput(articleContent=content),
+        x_user_id=x_user_id,
+        x_user_role=x_user_role,
+        authorization=authorization,
+    )
+
+
+@app.get("/v1/integrations/status")
+def integrations_status() -> dict[str, str]:
+    status: dict[str, str] = {}
+    repository_url = os.getenv("KC_ARTICLE_REPOSITORY_URL")
+    status["articleRepository"] = "configured" if repository_url else "not_configured"
+    status["approvedSearch"] = "configured" if os.getenv("KC_APPROVED_SEARCH_URL") else "not_configured"
+    status["redis"] = "configured" if os.getenv("REDIS_URL") else "not_configured"
+    status["qdrant"] = "configured" if os.getenv("QDRANT_URL") else "not_configured"
+    status["postgresAudit"] = "configured" if os.getenv("DATABASE_URL", "").startswith("postgresql") else "local_sqlite"
+    status["oidc"] = "configured" if os.getenv("KC_OIDC_ISSUER") and os.getenv("KC_OIDC_JWKS_URL") else "not_configured"
+    status["automaticPublishing"] = "disabled"
+    return status
 
 
 @app.post("/v1/architecture/design")
@@ -226,8 +321,9 @@ def design_architecture(
     payload: ArchitectureInput,
     x_user_id: str = Header(default="anonymous"),
     x_user_role: str = Header(default="Knowledge Analyst"),
+    authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
-    authorize(x_user_role, "design_architecture")
+    authorize(x_user_role, "design_architecture", authorization)
 
     unresolved = []
     if not payload.sources:
@@ -380,13 +476,35 @@ def review_article(
     payload: ArticleReviewInput,
     x_user_id: str = Header(default="anonymous"),
     x_user_role: str = Header(default="Knowledge Analyst"),
+    authorization: str | None = Header(default=None),
 ) -> ArticleReviewOutput:
-    authorize(x_user_role, "review_article")
+    authorize(x_user_role, "review_article", authorization)
     article_id = payload.articleId or f"AD-HOC-{uuid.uuid4().hex[:8]}"
     if payload.articleId:
-        source = SAMPLE_ARTICLES.get(payload.articleId)
-        if source is None:
-            raise HTTPException(status_code=404, detail="Article ID was not found in the approved knowledge repository.")
+        repository_url = os.getenv("KC_ARTICLE_REPOSITORY_URL")
+        if repository_url:
+            try:
+                response = httpx.get(
+                    f"{repository_url.rstrip('/')}/articles/{payload.articleId}",
+                    timeout=10,
+                )
+                response.raise_for_status()
+                retrieved = response.json()
+                source = {
+                    "title": str(retrieved.get("title", "")),
+                    "content": str(retrieved.get("content", "")),
+                }
+            except (httpx.HTTPError, ValueError) as exc:
+                raise HTTPException(status_code=502, detail="Approved article retrieval failed.") from exc
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "status": "INPUT_REQUIRED",
+                    "message": "Approved article repository is not configured or article ID was not found.",
+                    "requiredInputs": ["KC_ARTICLE_REPOSITORY_URL", "Article content"],
+                },
+            )
         content = source["content"]
         title = source["title"]
     else:
@@ -493,26 +611,40 @@ def find_gaps(
     payload: GapInput,
     x_user_id: str = Header(default="anonymous"),
     x_user_role: str = Header(default="Knowledge Analyst"),
+    authorization: str | None = Header(default=None),
 ) -> GapOutput:
-    authorize(x_user_role, "find_gaps")
+    authorize(x_user_role, "find_gaps", authorization)
     themes = [payload.theme, *payload.ticketThemes]
     matched = []
     evidence = []
+    environment = os.getenv("KC_ENVIRONMENT", "development").lower()
+    search_url = os.getenv("KC_APPROVED_SEARCH_URL")
 
-    for theme in themes:
-        lower = theme.lower()
-        for article_id, article in SAMPLE_ARTICLES.items():
-            article_text = f"{article['title']} {article['content']}".lower()
-            keywords = [word for word in re.findall(r"[a-z0-9]+", lower) if len(word) > 3]
-            if any(keyword in article_text for keyword in keywords):
+    if not search_url:
+        matched = []
+        evidence = []
+
+    if search_url:
+        try:
+            search_response = httpx.post(
+                search_url,
+                json={"themes": themes, "indexes": ["Knowledge Articles", "Resolution Notes"]},
+                headers={"api-key": os.getenv("KC_APPROVED_SEARCH_KEY", "")},
+                timeout=10,
+            )
+            search_response.raise_for_status()
+            for item in search_response.json().get("results", []):
+                article_id = str(item.get("id", "UNKNOWN"))
                 matched.append(article_id)
                 evidence.append(
                     Evidence(
                         sourceType="knowledge_article",
                         sourceId=article_id,
-                        excerpt=mask_sensitive(article["content"]),
+                        excerpt=mask_sensitive(str(item.get("content", item.get("text", "")))[:500]),
                     )
                 )
+        except (httpx.HTTPError, ValueError) as exc:
+            raise HTTPException(status_code=502, detail="Approved knowledge search failed.") from exc
 
     matched = sorted(set(matched))
     if matched:
@@ -529,11 +661,16 @@ def find_gaps(
 
     draft_article = {
         "title": f"Troubleshooting: {payload.theme}",
-        "prerequisites": "[TO REVIEW]",
+        "prerequisites": "[TO REVIEW] Add identity, access, environment, and device requirements.",
         "symptoms": payload.theme,
-        "steps": ["[TO REVIEW] Use only resolution steps approved in the submitted resolution notes."],
-        "validation": "[TO REVIEW]",
-        "rollback": "[TO REVIEW]",
+        "steps": (
+            [step.strip() for step in re.split(r"[\n;.]", payload.resolutionNotes or "") if step.strip()]
+            if payload.resolutionNotes
+            else ["[TO REVIEW] Use only resolution steps approved in the submitted resolution notes."]
+        ),
+        "validation": "[TO REVIEW] Add an observable confirmation of restored service.",
+        "rollback": "[TO REVIEW] Add the safe rollback or recovery action.",
+        "sourceStatus": "Derived from submitted resolution notes only" if payload.resolutionNotes else "Evidence missing",
         "approvalStatus": APPROVAL_STATUS,
     }
 
@@ -561,8 +698,9 @@ def approval_handoff(
     payload: dict[str, object],
     x_user_id: str = Header(default="anonymous"),
     x_user_role: str = Header(default="Knowledge Manager"),
+    authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
-    authorize(x_user_role, "approval_handoff")
+    authorize(x_user_role, "approval_handoff", authorization)
     request_id = str(uuid.uuid4())
     audit.append(
         x_user_id,

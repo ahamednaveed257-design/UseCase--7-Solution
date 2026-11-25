@@ -22,6 +22,7 @@ python -m streamlit run streamlit_app.py
 - `GET /health`
 - `POST /v1/articles/review`
 - `POST /v1/gaps/analyze`
+- `POST /v1/articles/upload`
 - `POST /v1/architecture/design`
 - `POST /v1/approval/handoff`
 
@@ -32,3 +33,19 @@ There is no publishing endpoint or automatic approval behavior.
 
 Local development audit events are stored in `knowledge_curator.db`. The payload and
 evidence count are recorded only after an operation is executed.
+
+## Containers
+
+```powershell
+docker compose up --build
+```
+
+The compose stack starts PostgreSQL, Redis, Qdrant, the API, and Streamlit. Set
+`POSTGRES_PASSWORD` and external integration variables before a shared or production
+deployment. `.env.example` lists approved integration settings.
+
+## Identity
+
+Development may use `x-user-role` only when `KC_ALLOW_HEADER_AUTH=true`. Production,
+UAT, and test require a validated OIDC bearer token and configured issuer, audience,
+and JWKS URL.
